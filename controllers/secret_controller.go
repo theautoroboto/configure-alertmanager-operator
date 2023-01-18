@@ -44,6 +44,8 @@ import (
 var log = logf.Log.WithName("secret_controller")
 
 const (
+	secretKeyGoalert = "GOALERT_KEY"
+
 	secretKeyPD = "PAGERDUTY_KEY" // #nosec G101
 
 	secretKeyDMS = "SNITCH_URL"
@@ -51,6 +53,8 @@ const (
 	cmKeyManagedNamespaces = "managed_namespaces.yaml"
 
 	cmKeyOCPNamespaces = "managed_namespaces.yaml"
+
+	secretNameGoalert = "goalert-secret"
 
 	secretNamePD = "pd-secret"
 
@@ -142,6 +146,7 @@ func (r *SecretReconciler) Reconcile(ctx context.Context, request ctrl.Request) 
 	// This operator is only interested in the 3 secrets & 1 configMap listed below. Skip reconciling for all other objects.
 	// TODO: Filter these with a predicate instead
 	switch request.Name {
+	case secretNameGoalert:
 	case secretNamePD:
 	case secretNameDMS:
 	case secretNameAlertmanager:
@@ -178,7 +183,7 @@ func (r *SecretReconciler) Reconcile(ctx context.Context, request ctrl.Request) 
 		reqLogger.Error(err, "Unable to list configMaps")
 	}
 
-	pagerdutyRoutingKey, watchdogURL := r.parseSecrets(reqLogger, secretList, request.Namespace, clusterReady)
+	pagerdutyRoutingKey, watchdogURL, goalertRoutingKey := r.parseSecrets(reqLogger, secretList, request.Namespace, clusterReady)
 	osdNamespaces := r.parseConfigMaps(reqLogger, cmList, request.Namespace)
 	reqLogger.Info("DEBUG: Adding PagerDuty routes for the following namespaces", "Namespaces", osdNamespaces)
 
@@ -194,7 +199,7 @@ func (r *SecretReconciler) Reconcile(ctx context.Context, request ctrl.Request) 
 	if err != nil {
 		reqLogger.Error(err, "Error reading cluster id.")
 	}
-	alertmanagerconfig := createAlertManagerConfig(pagerdutyRoutingKey, watchdogURL, ocmAgentURL, clusterID, clusterProxy, osdNamespaces)
+	alertmanagerconfig := createAlertManagerConfig(pagerdutyRoutingKey, goalertRoutingKey, watchdogURL, ocmAgentURL, clusterID, clusterProxy, osdNamespaces)
 
 	// write the alertmanager Config
 	writeAlertManagerConfig(r, reqLogger, alertmanagerconfig)
@@ -218,6 +223,20 @@ func (r *SecretReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&corev1.Secret{}).
 		Watches(&source.Kind{Type: &corev1.ConfigMap{}}, &handler.EnqueueRequestForObject{}).
 		Complete(r)
+}
+
+// createGoalertRoute creates an AlertManager Route for GoAlert in memory.
+func createGoalertRoute(namespaceList []string) *alertmanager.Route {
+	// order matters.
+	// these are sub-routes.  if any matches it will not continue processing.
+	// 1. route anything we consider critical to "make-it-critical"
+	// 2. route anything we want to silence to "null"
+	// 3. route anything that should be a warning to "make-it-warning"
+	// 4. route anything that should be an error to "make-it-error"
+	// 5. route anything we want to go to PD
+	//
+	// the Route docs can be read at https://prometheus.io/docs/alerting/latest/configuration/#matcher
+
 }
 
 // createPagerdutyRoute creates an AlertManager Route for PagerDuty in memory.
@@ -443,6 +462,15 @@ func createOCMAgentReceiver(ocmAgentURL string) []*alertmanager.Receiver {
 	}
 }
 
+func createGoalertConfig(goalertRoutingKey, clusterProxy string) *alertmanager.WebhookConfig {
+
+	return &alertmanager.WebhookConfig{
+		NotifierConfig: alertmanager.NotifierConfig{VSendResolved: true},
+		URL:            goalertRoutingKey,
+		HttpConfig:     createHttpConfig(clusterProxy),
+	}
+}
+
 // createPagerdutyConfig creates an AlertManager PagerdutyConfig for PagerDuty in memory.
 func createPagerdutyConfig(pagerdutyRoutingKey, clusterID string, clusterProxy string) *alertmanager.PagerdutyConfig {
 	detailsMap := map[string]string{
@@ -476,6 +504,22 @@ func createPagerdutyConfig(pagerdutyRoutingKey, clusterID string, clusterProxy s
 		Details:        detailsMap,
 		HttpConfig:     createHttpConfig(clusterProxy),
 	}
+}
+
+// createGoalertReceivers creates an AlertManager Receiver for Goalert in memory.
+func createGoalertReceivers(goalertRoutingKey, clusterID string, clusterProxy string) []*alertmanager.Receiver {
+	if goalertRoutingKey == "" {
+		return []*alertmanager.Receiver{}
+	}
+
+	receivers := []*alertmanager.Receiver{
+		{
+			Name:           clusterID,
+			WebhookConfigs: []*alertmanager.WebhookConfig{createGoalertConfig(goalertRoutingKey, clusterProxy)},
+		},
+	}
+
+	return receivers
 }
 
 // createPagerdutyReceivers creates an AlertManager Receiver for PagerDuty in memory.
@@ -559,7 +603,7 @@ func createHttpConfig(clusterProxy string) alertmanager.HttpConfig {
 }
 
 // createAlertManagerConfig creates an AlertManager Config in memory based on the provided input parameters.
-func createAlertManagerConfig(pagerdutyRoutingKey, watchdogURL, ocmAgentURL, clusterID string, clusterProxy string, namespaceList []string) *alertmanager.Config {
+func createAlertManagerConfig(pagerdutyRoutingKey, goalertRoutingKey, watchdogURL, ocmAgentURL, clusterID string, clusterProxy string, namespaceList []string) *alertmanager.Config {
 	routes := []*alertmanager.Route{}
 	receivers := []*alertmanager.Receiver{}
 
@@ -576,6 +620,13 @@ func createAlertManagerConfig(pagerdutyRoutingKey, watchdogURL, ocmAgentURL, clu
 	if pagerdutyRoutingKey != "" {
 		routes = append(routes, createPagerdutyRoute(namespaceList))
 		receivers = append(receivers, createPagerdutyReceivers(pagerdutyRoutingKey, clusterID, clusterProxy)...)
+	}
+
+	if config.IsFedramp() {
+		if goalertRoutingKey != "" {
+			routes = append(routes, createGoalertRoute(namespaceList))
+			receivers = append(receivers, createGoalertReceivers(goalertRoutingKey, clusterID, clusterProxy)...)
+		}
 	}
 
 	// always have the "null" receiver
@@ -784,14 +835,28 @@ func (r *SecretReconciler) readOCMAgentServiceURLFromConfig(reqLogger logr.Logge
 	return serviceURL
 }
 
-func (r *SecretReconciler) parseSecrets(reqLogger logr.Logger, secretList *corev1.SecretList, namespace string, clusterReady bool) (pagerdutyRoutingKey string, watchdogURL string) {
+func (r *SecretReconciler) parseSecrets(reqLogger logr.Logger, secretList *corev1.SecretList, namespace string, clusterReady bool) (pagerdutyRoutingKey string, watchdogURL string, goalertRoutingKey string) {
 	// Check for the presence of specific secrets.
+	goalertSecretExists := secretInList(reqLogger, secretNameGoalert, secretList)
 	pagerDutySecretExists := secretInList(reqLogger, secretNamePD, secretList)
 	snitchSecretExists := secretInList(reqLogger, secretNameDMS, secretList)
 
 	// do the work! collect secret info for PD and DMS
+	goalertRoutingKey = ""
 	pagerdutyRoutingKey = ""
 	watchdogURL = ""
+
+	if goalertSecretExists {
+		reqLogger.Info("INFO: Goalert secret exists")
+		if clusterReady {
+			reqLogger.Info("INFO: Cluster is ready; configuring Goalert")
+			goalertRoutingKey = readSecretKey(r, secretNameGoalert, namespace, secretKeyGoalert)
+		} else {
+			reqLogger.Info("INFO: Cluster is not ready; skipping Goalert configuration")
+		}
+	} else {
+		reqLogger.Info("INFO: Goalert secret does not exist")
+	}
 
 	// If a secret exists, add the necessary configs to Alertmanager.
 	// But don't activate PagerDuty unless the cluster is "ready".
@@ -815,7 +880,7 @@ func (r *SecretReconciler) parseSecrets(reqLogger logr.Logger, secretList *corev
 		reqLogger.Info("INFO: Dead Man's Snitch secret does not exist")
 	}
 
-	return pagerdutyRoutingKey, watchdogURL
+	return pagerdutyRoutingKey, watchdogURL, goalertRoutingKey
 }
 
 func (r *SecretReconciler) getClusterID() (string, error) {
