@@ -468,13 +468,15 @@ func createSubroutes(namespaceList []string, receiver receiverType) *alertmanage
 	}
 
 	for _, namespace := range namespaceList {
-		subroute = append(subroute, []*alertmanager.Route{
-			// https://issues.redhat.com/browse/OSD-3086
-			// https://issues.redhat.com/browse/OSD-5872
-			{Receiver: receiverCommon, MatchRE: map[string]string{"exported_namespace": namespace}, Match: map[string]string{"prometheus": "openshift-monitoring/k8s"}},
-			// general: route anything in core namespaces to PD
-			{Receiver: receiverCommon, MatchRE: map[string]string{"namespace": namespace}, Match: map[string]string{"exported_namespace": "", "prometheus": "openshift-monitoring/k8s"}},
-		}...)
+		if receiver == Pagerduty {
+			subroute = append(subroute, []*alertmanager.Route{
+				// https://issues.redhat.com/browse/OSD-3086
+				// https://issues.redhat.com/browse/OSD-5872
+				{Receiver: receiverCommon, MatchRE: map[string]string{"exported_namespace": namespace}, Match: map[string]string{"prometheus": "openshift-monitoring/k8s"}},
+				// general: route anything in core namespaces to PD
+				{Receiver: receiverCommon, MatchRE: map[string]string{"namespace": namespace}, Match: map[string]string{"exported_namespace": "", "prometheus": "openshift-monitoring/k8s"}},
+			}...)
+		}
 		// GoAlert config
 		if receiver == GoAlert {
 			subroute = append(subroute, []*alertmanager.Route{
