@@ -269,7 +269,7 @@ func createSubroutes(namespaceList []string, receiver receiverType) *alertmanage
 		receiverCritical = receiverGoAlertHigh
 		receiverError = receiverGoAlertHigh
 		receiverWarning = receiverGoAlertLow
-		receiverDefault = receiverGoAlertLow
+		receiverDefault = defaultReceiver
 	case Pagerduty:
 		receiverCommon = receiverPagerduty
 		receiverCritical = receiverMakeItCritical
